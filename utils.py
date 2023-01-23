@@ -125,6 +125,21 @@ def evaluate(model, loader, get_yp_func, multitask=False, predict_place=False):
         return get_results(acc_groups, get_yp_func), get_results(acc_place_groups, get_yp_func)
     return get_results(acc_groups, get_yp_func)
 
+def evaluate_no_min_group(model, loader):
+    correct = 0
+    total = 0
+    model.eval()
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.cuda(), y.cuda()
+            logits = model(x)
+            preds = torch.argmax(logits, axis=1)
+            correct_batch = (preds == y)
+            correct += correct_batch.sum().item()
+            total += correct_batch.shape[0]
+
+    model.train()
+    return correct / total
 
 class MultiTaskHead(nn.Module):
     def __init__(self, n_features, n_classes_list):

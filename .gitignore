@@ -137,3 +137,4 @@ wandb/
 # slurm output
 slurm-*.out
 *.ckpt
+logs/*
