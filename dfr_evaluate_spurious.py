@@ -133,10 +133,6 @@ def get_model(args):
 train_loader = get_train_dataset('clean', args.batch_size, args.num_workers, percent_train=args.percent_train)
 test_loader  = get_test_dataset(8*args.batch_size, args.num_workers, normalize=(not args.no_normalize))
 
-loader_kwargs = {'batch_size': args.batch_size,
-                 'num_workers': args.num_workers, 'pin_memory': True,
-                 "reweight_places": None}
-
 
 # Load model
 n_classes = 10
