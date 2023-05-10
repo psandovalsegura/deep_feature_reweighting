@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --account=djacobs
 #SBATCH --job-name=all-ckpt-dfr
-#SBATCH --time=0-8:00:00
-#SBATCH --partition=dpart
-#SBATCH --qos=default
+#SBATCH --time=1-12:00:00
+#SBATCH --partition=scavenger
+#SBATCH --qos=scavenger
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:p6000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=4G
-#SBATCH --array=7-7
+#SBATCH --array=0-0
 #SBATCH --output=slurm-%j-%x.out
 #--SBATCH --dependency=afterok:
 #--SBATCH --mail-type=end          
@@ -17,10 +17,10 @@
 
 set -x
 
-# DATA_NAMES=('clean' 'ntga' 'error-max' 'untargeted-error-max' 'error-min' 'robust-error-min' 'ar' 'regions-4' 'patches-4' 'patches-8')
-declare -a DATA_NAMES=('clean' 'error-min' 'error-max' 'ar' 'ntga' 'robust-error-min' 'regions-4' 'cwrandom' 'random-init-network')
+declare -a DATA_NAMES=('error-max' 'error-min'  'l2-ar' 'ntga' 'regions-4' 'cwrandom' 'robust-error-min')
 export DATA_NAME=${DATA_NAMES[$SLURM_ARRAY_TASK_ID]}
 
 
 python3 dfr_evaluate_spurious_all_epochs.py\
-    /fs/vulcan-projects/stereo-detection/poison_ckpts/every-epoch-ckpt/linf-poison/${DATA_NAME}
+    /fs/vulcan-projects/stereo-detection/unlearnable-ds-neurips-23/dfr-ckpts/${DATA_NAME} \
+    # --random_init_ckpt

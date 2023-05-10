@@ -6,7 +6,7 @@ import numpy as np
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 
-from poison_datasets import get_train_dataset, get_test_dataset
+from poison_datasets import construct_train_dataset, get_test_loader
 from utils import evaluate_no_min_group
 from models import *
 
@@ -15,10 +15,8 @@ REG = "l1"
 def get_model(ckpt_path):
     model = ResNet18(num_classes=10)
     # d = model.linear.in_features
-    if ckpt_path is not None and ('random-init-network' not in ckpt_path):
-        state_dict = torch.load(ckpt_path)['state_dict']
-        # Remove 'model.' prefix
-        state_dict = {k[6:]: v for k, v in state_dict.items()}
+    if ckpt_path is not None:
+        state_dict = torch.load(ckpt_path)
         model.load_state_dict(state_dict=state_dict)
     # model.linear = torch.nn.Linear(d, 10)
     model.cuda()
@@ -83,6 +81,60 @@ def dfr_on_validation_eval(c, all_embeddings, all_y, num_retrains=20, preprocess
     test_acc = (preds_test == y_test).mean()
     return test_acc
 
+def print_and_save(dfr_results, ckpt_directory, result_path):
+    # Print results in the following format:
+    # Base test accuracies: (epoch, pre_dfr)
+    # (epoch, pre_dfr)
+    # (epoch, pre_dfr)
+    # ...
+    # DFR test accuracies: (epoch, post_dfr)
+    # (epoch, post_dfr)
+    # (epoch, post_dfr)
+    # ...
+    max_epoch = max(dfr_results.keys())
+    print("CKPT test accuracies:")
+    for i in range(max_epoch+1):
+        print(f"({i}, {dfr_results[i]['pre_dfr'] * 100:0.3f})")
+    print("DFR test accuracies:")
+    for i in range(max_epoch+1):
+        print(f"({i}, {dfr_results[i]['post_dfr'] * 100:0.3f})")
+
+    # Save results
+    ckpt_name = ckpt_directory.split("/")[-1]
+    results_path = os.path.join(result_path, ckpt_name)
+    if not os.path.exists(results_path):
+        os.makedirs(results_path)
+
+    # Save results as list for easy reading
+    text_path = os.path.join(results_path, f'list.txt')
+    with open(text_path, 'w') as f:
+        f.write("Base test accuracies:\n")
+        for i in range(max_epoch+1):
+            f.write(f"({i}, {dfr_results[i]['pre_dfr'] * 100:0.3f})\n")
+        f.write("DFR test accuracies:\n")
+        for i in range(max_epoch+1):
+            f.write(f"({i}, {dfr_results[i]['post_dfr'] * 100:0.3f})\n")
+
+    # Save results as json for easy loading
+    json_path = os.path.join(results_path, f'list.json')
+    with open(json_path, 'w') as f:
+        # dump all_results as readable json
+        json.dump(dfr_results, f, indent=4)
+
+def get_subset_train_loader(setup_key, percent, batch_size, num_workers, normalize=True):
+    train_ds = construct_train_dataset(setup_key=setup_key,
+                                       normalize=normalize)
+    train_idx = np.load(os.path.join('dfr_indices', f"train_{percent}pct.npy"))
+    train_ds = torch.utils.data.Subset(train_ds, train_idx)
+    train_loader = torch.utils.data.DataLoader(train_ds,
+                                               batch_size=batch_size,
+                                               shuffle=True,
+                                               num_workers=num_workers,
+                                               pin_memory=True)
+    return train_loader
+
+
+
 def main():
     parser = argparse.ArgumentParser(description="Tune and evaluate DFR on all checkpoints.")
     parser.add_argument(
@@ -97,14 +149,43 @@ def main():
         "--batch_size", type=int, default=128, required=False,
         help="Batch size")
     parser.add_argument(
-        "--percent_train", type=float, default=0.3, required=False,
+        "--percent_train", type=int, default=10, required=False,
         help="Percent of clean training data to use")
+    parser.add_argument(
+        "--random_init_ckpt", action="store_true",
+        help="Whether to use random init ckpt"
+    )
     args = parser.parse_args()
     print(args)
 
-    ## Load data (30% of original training set)
-    train_loader = get_train_dataset('clean', 8*args.batch_size, args.num_workers, percent_train=args.percent_train)
-    test_loader  = get_test_dataset(8*args.batch_size, args.num_workers, normalize=True)
+    args.result_path = os.path.join(args.result_path, f'{args.percent_train}pct')
+
+    ## Load data 
+    train_loader = get_subset_train_loader(setup_key='cifar10',
+                                           batch_size=8*args.batch_size,
+                                           num_workers=args.num_workers,
+                                           percent=args.percent_train)
+                
+    test_loader  = get_test_loader(setup_key='cifar10', 
+                                   batch_size=8*args.batch_size, 
+                                   num_workers=args.num_workers, 
+                                   normalize=True)
+
+    # If random init ckpt, then compute results for only one model
+    if args.random_init_ckpt:
+        print("Evaluating DFR on random init model")
+        dfr_results = {}
+        model = get_model(None)
+        base_model_results = {}
+        base_model_results["pre_dfr"] = evaluate_no_min_group(model, test_loader)
+
+        all_embeddings, all_y = get_all_embeddings(model, train_loader, test_loader)
+        c = 1.0
+        test_acc = dfr_on_validation_eval(c, all_embeddings, all_y, num_retrains=1)
+        base_model_results["post_dfr"] = test_acc
+        dfr_results[0] = base_model_results
+        print_and_save(dfr_results, 'tmp/random-init', args.result_path)
+        return
     
     # Get the list of checkpoints
     ckpt_list = os.listdir(args.ckpt_directory)
@@ -118,43 +199,16 @@ def main():
 
         # Evaluate model
         base_model_results = {}
-        epoch = int(ckpt.split("epoch=")[1].split(".ckpt")[0])
-        base_model_results["base_test"] = evaluate_no_min_group(model, test_loader)
-        model.eval()
+        epoch = int(ckpt.split("=")[-1].split(".")[0]) # checkpoint name is of the form 'epoch={e}.pt'
+        base_model_results["pre_dfr"] = evaluate_no_min_group(model, test_loader)
 
         all_embeddings, all_y = get_all_embeddings(model, train_loader, test_loader)
 
         c = 1.0
         test_acc = dfr_on_validation_eval(c, all_embeddings, all_y, num_retrains=1)
-        base_model_results["dfr_test"] = test_acc
+        base_model_results["post_dfr"] = test_acc
         dfr_results[epoch] = base_model_results
-
-    # Print results in the following format:
-    # Base test accuracies: (epoch, base_test)
-    # (epoch, base_test)
-    # (epoch, base_test)
-    # ...
-    # DFR test accuracies: (epoch, dfr_test)
-    # (epoch, dfr_test)
-    # (epoch, dfr_test)
-    # ...
-    max_epoch = max(dfr_results.keys())
-    print("Base test accuracies:")
-    for i in range(max_epoch+1):
-        print(f"({dfr_results[i]['epoch']}, {dfr_results[i]['base_test']:0.3f})")
-    print("DFR test accuracies:")
-    for i in range(max_epoch+1):
-        print(f"({dfr_results[i]['epoch']}, {dfr_results[i]['dfr_test']:0.3f})")
-
-    # Save results
-    dataset_name = args.ckpt_directory.split("every-epoch-ckpt/linf-poison/")[1]
-    results_path = os.path.join(args.result_path, 'every-epoch-ckpt', dataset_name)
-    print('results_path', results_path)
-    if not os.path.exists(results_path):
-        os.makedirs(results_path)
-    with open(os.path.join(results_path, f'{dataset_name}.json'), 'w') as f:
-        # dump all_results as readable json
-        json.dump(dfr_results, f, indent=4)
+    print_and_save(dfr_results, args.ckpt_directory, args.result_path)
 
 if __name__ == '__main__':
     main()

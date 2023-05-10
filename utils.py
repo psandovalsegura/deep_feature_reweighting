@@ -137,8 +137,6 @@ def evaluate_no_min_group(model, loader):
             correct_batch = (preds == y)
             correct += correct_batch.sum().item()
             total += correct_batch.shape[0]
-
-    model.train()
     return correct / total
 
 class MultiTaskHead(nn.Module):

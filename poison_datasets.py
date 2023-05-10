@@ -1,18 +1,39 @@
 import os
 import pickle
+import collections
 import numpy as np
 from PIL import Image
 import torch
 import torchvision
 from torchvision import transforms, datasets
 
-from constants import CIFAR10_ROOT, POISON_ROOTS, TAP_FORMAT_POISONS
+from constants import DATA_SETUPS, CIFAR10_ROOT, CIFAR100_ROOT, SVHN_ROOT, \
+                      IMAGENET100_ROOT, TRANSFORM_OPTIONS, NORMALIZE_CONSTANTS
 
+class ImageNetMini(datasets.ImageNet):
+    def __init__(self, root, split='train', **kwargs):
+        super(ImageNetMini, self).__init__(root, split=split, **kwargs)
+        self.new_targets = []
+        self.new_images = []
+        for i, (file, cls_id) in enumerate(self.imgs):
+            if cls_id <= 99:
+                self.new_targets.append(cls_id)
+                self.new_images.append((file, cls_id))
+        self.imgs = self.new_images
+        self.targets = self.new_targets
+        self.samples = self.imgs
+        print('[class ImageNetMini] num samples:', len(self.samples))
+        print('[class ImageNetMini] num targets:', len(self.targets))
+        return
+    
 class NTGA(torchvision.datasets.VisionDataset):
     def __init__(self, root, transform=None, target_transform=None):
         super().__init__(root, transform=transform, target_transform=target_transform)
-        x_file = 'x_train_cifar10_ntga_fnn_best.npy'
-        y_file = 'y_train_cifar10.npy' # in one-hot encoding
+        # x_file should be named with an 'x_train_' prefix
+        # y_file should be named with a 'y_train_' prefix
+        # choose file which matches the prefix
+        x_file = [f for f in os.listdir(root) if f.startswith('x_train_')][0]
+        y_file = [f for f in os.listdir(root) if f.startswith('y_train_')][0] # in one-hot encoding
         x = np.load(os.path.join(root, x_file))
         y = np.load(os.path.join(root, y_file))
         x = (x * 255).astype(np.uint8)
@@ -60,8 +81,9 @@ class TAPFormatPoison(torch.utils.data.Dataset):
                                             self.samples[idx]))), label
 
 class UnlearnablePoison(torch.utils.data.Dataset):
-    def __init__(self, root, baseset):
+    def __init__(self, root, dataset_name, baseset):
         self.baseset = baseset
+        self.dataset_name = dataset_name
         self.root = root
         self.classwise = 'classwise' in root
         noise = torch.load(os.path.join(root, 'perturbation.pt'))
@@ -76,18 +98,60 @@ class UnlearnablePoison(torch.utils.data.Dataset):
         return self.baseset[idx]
 
     def _perturb_images(self, noise):
-        if 'stl' in self.root.lower() or 'svhn' in self.root.lower():
+        if self.dataset_name in ['STL10', 'SVHN']:
             perturb_noise = noise.mul(255).clamp_(-255, 255).to('cpu').numpy()
         else:
             perturb_noise = noise.mul(255).clamp_(-255, 255).permute(0, 2, 3, 1).to('cpu').numpy()
         self.baseset.data = self.baseset.data.astype(np.float32)
         for i in range(len(self.baseset)):
             if self.classwise:
-                self.baseset.data[i] += perturb_noise[self.baseset.targets[i]]
+                if self.dataset_name in ['STL10', 'SVHN']:
+                    self.baseset.data[i] += perturb_noise[self.baseset.labels[i]]
+                else:
+                    self.baseset.data[i] += perturb_noise[self.baseset.targets[i]]
             else: # samplewise
                 self.baseset.data[i] += perturb_noise[i]
             self.baseset.data[i] = np.clip(self.baseset.data[i], a_min=0, a_max=255)
         self.baseset.data = self.baseset.data.astype(np.uint8)
+
+class UnlearnableImageNetPoison(ImageNetMini):
+    def __init__(self, root, split, poison_rate=1.0, seed=0,
+                 perturb_tensor_filepath=None, **kwargs):
+        super(UnlearnableImageNetPoison, self).__init__(root=root, split=split, **kwargs)
+        np.random.seed(seed)
+        self.poison_rate = poison_rate
+        self.perturb_tensor = torch.load(perturb_tensor_filepath)
+        self.perturb_tensor = self.perturb_tensor.mul(255).clamp_(-255, 255).permute(0, 2, 3, 1).to('cpu').numpy()
+
+        # Random Select Poison Targets
+        targets = list(range(0, len(self)))
+        self.poison_samples_idx = sorted(np.random.choice(targets, int(len(targets) * poison_rate), replace=False).tolist())
+        self.poison_samples = collections.defaultdict(lambda: False)
+        self.poison_class = []
+        for idx in self.poison_samples_idx:
+            self.poison_samples[idx] = True
+
+        print('[class UnlearnableImageNetPoison] Perturb tensor shape:', self.perturb_tensor.shape)
+        print('[class UnlearnableImageNetPoison] Poison samples: %d/%d' % (len(self.poison_samples), len(self)))
+
+    def __getitem__(self, index):
+        path, target = self.samples[index]
+        sample = self.loader(path)
+        sample = np.array(transforms.RandomResizedCrop(224)(sample)).astype(np.float32)
+
+        if self.poison_samples[index]:
+            noise = self.perturb_tensor[target]
+            sample = sample + noise
+            sample = np.clip(sample, 0, 255)
+        sample = sample.astype(np.uint8)
+        sample = Image.fromarray(sample).convert('RGB')
+
+        if self.transform is not None:
+            sample = self.transform(sample)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return sample, target
 
 class RobustErrorMin(torch.utils.data.Dataset):
     def __init__(self, root, baseset):
@@ -122,31 +186,88 @@ class RobustErrorMin(torch.utils.data.Dataset):
         imgs = imgs.clip(0,255).astype(np.uint8)
         self.baseset.data = imgs
 
-def get_train_dataset(dataset_name, batch_size, num_workers, percent_train):    
-    transform_list = [transforms.RandomCrop(32, padding=4),
-                      transforms.RandomHorizontalFlip(),
-                      transforms.ToTensor(), 
-                      transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616))]
-    transform = transforms.Compose(transform_list)
-
-    if dataset_name == 'clean':
-        ds = datasets.CIFAR10(root=CIFAR10_ROOT, train=True, download=False, transform=transform)
+def get_torchvision_dataset(dataset_name, train, transforms_key, normalize=True, transform_only=False):
+    transform_list = TRANSFORM_OPTIONS[dataset_name][transforms_key]
+    normalize_mean = NORMALIZE_CONSTANTS[dataset_name]['mean']
+    normalize_std = NORMALIZE_CONSTANTS[dataset_name]['std']
+    if dataset_name == 'CIFAR10':
+        if normalize:
+            transform_list.append(transforms.Normalize(normalize_mean, normalize_std))
+        transform = transforms.Compose(transform_list)
+        if transform_only:
+            return None, transform
+        ds = datasets.CIFAR10(root=CIFAR10_ROOT, train=train, download=False, transform=transform)
+    elif dataset_name == 'CIFAR100':
+        if normalize:
+            transform_list.append(transforms.Normalize(normalize_mean, normalize_std))
+        transform = transforms.Compose(transform_list)
+        if transform_only:
+            return None, transform
+        ds = datasets.CIFAR100(root=CIFAR100_ROOT, train=train, download=False, transform=transform)
+    elif dataset_name == 'SVHN':
+        if normalize:
+            transform_list.append(transforms.Normalize(normalize_mean, normalize_std))
+        transform = transforms.Compose(transform_list)
+        if transform_only:
+            return None, transform
+        ds = datasets.SVHN(root=SVHN_ROOT, split='train' if train else 'test', download=False, transform=transform)
+    elif dataset_name == 'IMAGENET100':
+        if normalize:
+            transform_list.append(transforms.Normalize(normalize_mean, normalize_std))
+        transform = transforms.Compose(transform_list)
+        if transform_only:
+            return None, transform
+        ds = ImageNetMini(root=IMAGENET100_ROOT, split=('train' if train else 'val'), transform=transform)
     else:
-        raise ValueError(f'Dataset {dataset_name} not supported!')
+        raise NotImplementedError
+    return ds
 
-    # Take a subset of the training data
-    indices = torch.randperm(len(ds)).tolist()
-    train_indices = indices[:int(len(indices)*percent_train)]
-    train_subset = torch.utils.data.Subset(ds, train_indices)
+def construct_train_dataset(setup_key, normalize, transforms_key=None, is_ortho_proj=False):
+    """
+    setup_key: key for dataset setup in DATA_SETUPS
+    """
+    setup = DATA_SETUPS[setup_key]
+    dataset_name, dataset_root, dataset_type = setup['dataset_name'], setup['root'], setup['dataset_type']
+    transforms_key = 'train_transform' if transforms_key is None else transforms_key
+    if dataset_type == 'STANDARD':
+        ds = get_torchvision_dataset(dataset_name, train=True, transforms_key=transforms_key, 
+                                  normalize=normalize)
+    elif dataset_type == 'TAP':
+        baseset = get_torchvision_dataset(dataset_name, train=True, transforms_key=transforms_key, 
+                                       normalize=normalize)
+        ds = TAPFormatPoison(dataset_root, baseset)
+    elif dataset_type == 'ULE':
+        baseset = get_torchvision_dataset(dataset_name, train=True, transforms_key=transforms_key, 
+                                       normalize=normalize)
+        ds = UnlearnablePoison(dataset_root, dataset_name, baseset)
+    elif dataset_type == 'ULE_IMAGENET':
+        _, transform = get_torchvision_dataset(dataset_name, train=True, transforms_key=transforms_key,
+                                            normalize=normalize, transform_only=True)
+        perturb_tensor_filepath = os.path.join(dataset_root, 'perturbation.pt')
+        ds = UnlearnableImageNetPoison(root=IMAGENET100_ROOT, split='train', 
+                                       perturb_tensor_filepath=perturb_tensor_filepath, 
+                                       transform=transform)
+    elif dataset_type == 'REM':
+        baseset = get_torchvision_dataset(dataset_name, train=True, transforms_key=transforms_key, 
+                                       normalize=normalize)
+        ds = RobustErrorMin(dataset_root, baseset)
+    elif dataset_type == 'NTGA':
+        _, transform = get_torchvision_dataset(dataset_name, train=True, transforms_key=transforms_key, 
+                                            normalize=normalize, transform_only=True)
+        ds = NTGA(root=dataset_root, transform=transform)
+    else:
+        raise NotImplementedError
+    return ds
 
-    loader = torch.utils.data.DataLoader(train_subset, batch_size=batch_size, shuffle=True, num_workers=num_workers)
+
+def get_train_loader(setup_key, batch_size, num_workers, normalize=True, shuffle=True):
+    ds = construct_train_dataset(setup_key, normalize=normalize)
+    loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=shuffle, num_workers=num_workers)
     return loader
 
-def get_test_dataset(batch_size, num_workers, normalize=True):
-    transform_list = [transforms.ToTensor()]
-    if normalize:
-        transform_list.append(transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2470, 0.2435, 0.2616)))
-    transform = transforms.Compose(transform_list)
-    ds = datasets.CIFAR10(root=CIFAR10_ROOT, train=False, download=False, transform=transform)
+def get_test_loader(setup_key, batch_size, num_workers, normalize=True):
+    setup = DATA_SETUPS[setup_key]
+    dataset_name = setup['dataset_name']
+    ds = get_torchvision_dataset(dataset_name, train=False, transforms_key='test_transform', normalize=normalize)
     loader = torch.utils.data.DataLoader(ds, batch_size=batch_size, shuffle=False, num_workers=num_workers)
     return loader
