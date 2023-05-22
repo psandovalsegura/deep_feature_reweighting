@@ -8,7 +8,7 @@
 #SBATCH --gres=gpu:p6000:1
 #SBATCH --cpus-per-task=4
 #SBATCH --mem-per-cpu=4G
-#SBATCH --array=0-0
+#SBATCH --array=0-3
 #SBATCH --output=slurm-%j-%x.out
 #--SBATCH --dependency=afterok:
 #--SBATCH --mail-type=end          
@@ -17,7 +17,8 @@
 
 set -x
 
-declare -a DATA_NAMES=('error-max' 'error-min'  'l2-ar' 'ntga' 'regions-4' 'cwrandom' 'robust-error-min')
+# declare -a DATA_NAMES=('error-max' 'error-min'  'l2-ar' 'ntga' 'regions-4' 'cwrandom' 'robust-error-min')
+declare -a DATA_NAMES=('lsp' 'ops' 'ops-plus-em' 'error-min-CW')
 export DATA_NAME=${DATA_NAMES[$SLURM_ARRAY_TASK_ID]}
 
 

@@ -126,3 +126,23 @@ class ViT(nn.Module):
 
         x = self.to_cls_token(x[:, 0])
         return self.mlp_head(x)
+
+    def embed(self, img, mask = None):
+        """
+        Return an image embedding
+        """
+        p = self.patch_size
+
+        x = rearrange(img, 'b c (h p1) (w p2) -> b (h w) (p1 p2 c)', p1 = p, p2 = p)
+        x = self.patch_to_embedding(x)
+        b, n, _ = x.shape
+
+        cls_tokens = self.cls_token.expand(b, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x += self.pos_embedding[:, :(n + 1)]
+        x = self.dropout(x)
+
+        x = self.transformer(x, mask)
+        return x[:, 0]
+        
+
