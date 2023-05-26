@@ -99,15 +99,20 @@ class ResNet(nn.Module):
         out = self.layer2(out)
         out = self.layer3(out)
         out = self.layer4(out)
-        out = F.avg_pool2d(out, 4)
+        out = F.adaptive_avg_pool2d(out, (1, 1))
         out = out.view(out.size(0), -1)
         out = self.linear(out)
         return out
 
 
-def ResNet18(num_classes=10):
+def ResNet18(dataset='CIFAR10'):
+    if dataset in ['CIFAR10', 'STL10', 'SVHN']:
+        num_classes = 10
+    elif dataset in ['CIFAR100', 'IMAGENET100']:
+        num_classes = 100
+    else:
+        raise ValueError(f'Invalid dataset {dataset} in ResNet18')
     return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes)
-
 
 def ResNet34(num_classes=10):
     return ResNet(BasicBlock, [3, 4, 6, 3], num_classes=num_classes)

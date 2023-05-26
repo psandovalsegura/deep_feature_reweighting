@@ -165,7 +165,7 @@ def dfr_on_validation_eval(c, all_embeddings, all_y, num_retrains=20, num_classe
     test_acc = (preds_test == y_test).mean()
     return test_acc
 
-def print_and_save(dfr_results, ckpt_directory, result_path):
+def print_and_save(dfr_results, ckpt_directory, result_path, epoch):
     # Print results in the following format:
     # Base test accuracies: (epoch, pre_dfr)
     # (epoch, pre_dfr)
@@ -175,46 +175,47 @@ def print_and_save(dfr_results, ckpt_directory, result_path):
     # (epoch, post_dfr)
     # (epoch, post_dfr)
     # ...
-    max_epoch = max(dfr_results.keys())
-    print("CKPT test accuracies:")
-    for i in range(max_epoch+1):
-        print(f"({i}, {dfr_results[i]['pre_dfr'] * 100:0.3f})")
-    print("DFR test accuracies:")
-    for i in range(max_epoch+1):
-        print(f"({i}, {dfr_results[i]['post_dfr'] * 100:0.3f})")
-
+    
     # Save results
     ckpt_name = ckpt_directory.split("/")[-1]
     results_path = os.path.join(result_path, ckpt_name)
     if not os.path.exists(results_path):
         os.makedirs(results_path)
 
-    # Save results as list for easy reading
-    text_path = os.path.join(results_path, f'list.txt')
-    with open(text_path, 'w') as f:
-        f.write("Base test accuracies:\n")
-        for i in range(max_epoch+1):
-            f.write(f"({i}, {dfr_results[i]['pre_dfr'] * 100:0.3f})\n")
-        f.write("DFR test accuracies:\n")
-        for i in range(max_epoch+1):
-            f.write(f"({i}, {dfr_results[i]['post_dfr'] * 100:0.3f})\n")
-
     # Save results as json for easy loading
-    json_path = os.path.join(results_path, f'list.json')
+    json_path = os.path.join(results_path, f'{epoch}.json')
     with open(json_path, 'w') as f:
         # dump all_results as readable json
         json.dump(dfr_results, f, indent=4)
+    
+    print(f"({epoch}, {dfr_results[epoch]['post_dfr'] * 100:0.3f})")
 
-def get_subset_train_loader(setup_key, percent, batch_size, num_workers, normalize=True):
+def get_subset_train_loader(setup_key, num_dfr_train, batch_size, num_workers, normalize=True):
     train_ds = construct_train_dataset(setup_key=setup_key,
                                        normalize=normalize)
-    train_idx = np.load(os.path.join('dfr_indices', f"train_{percent}pct.npy"))
+    setup = DATA_SETUPS[setup_key]
+    dataset_name = setup['dataset_name']
+
+    # if dataset_name exists in dfr_indices, load the indices
+    # otherwise, create the indices and save them
+    dfr_indices_dir = os.path.join('dfr_indices', dataset_name)
+    if not os.path.exists(dfr_indices_dir):
+        os.makedirs(dfr_indices_dir)
+    dfr_indices_path = os.path.join(dfr_indices_dir, f"train_{num_dfr_train}samples.npy")
+    if os.path.exists(dfr_indices_path):
+        train_idx = np.load(dfr_indices_path)
+        print(f"Loaded {num_dfr_train} indices from {dfr_indices_path}.")
+    else:
+        train_idx = np.random.choice(len(train_ds), num_dfr_train, replace=False)
+        np.save(dfr_indices_path, train_idx)
+        print(f"No indices file. Saved {num_dfr_train} indices to {dfr_indices_path}.")
+
     train_ds = torch.utils.data.Subset(train_ds, train_idx)
     train_loader = torch.utils.data.DataLoader(train_ds,
-                                               batch_size=batch_size,
-                                               shuffle=True,
-                                               num_workers=num_workers,
-                                               pin_memory=True)
+                                                batch_size=batch_size,
+                                                shuffle=True,
+                                                num_workers=num_workers,
+                                                pin_memory=True)
     return train_loader
 
 
@@ -227,6 +228,8 @@ def main():
     parser.add_argument(
         'model_name', type=str, default='',
         help="The model name")
+    parser.add_argument('epoch', type=int, default=0,
+                        help="Epoch to evaluate")
     parser.add_argument(
         "--setup_key", type=str, default="cifar10",
         help="Dataset name")
@@ -239,8 +242,8 @@ def main():
         "--batch_size", type=int, default=128, required=False,
         help="Batch size")
     parser.add_argument(
-        "--percent_train", type=int, default=10, required=False,
-        help="Percent of clean training data to use")
+        "--num_dfr_train", type=int, default=5000, required=False,
+        help="Number of clean training data to use")
     parser.add_argument(
         "--random_init_ckpt", action="store_true",
         help="Whether to use random init ckpt"
@@ -251,13 +254,13 @@ def main():
     args.result_path = os.path.join(args.result_path, 
                                     args.setup_key,
                                     args.model_name,
-                                    f'{args.percent_train}pct')
+                                    f'{args.num_dfr_train}samples')
 
     ## Load data 
     train_loader = get_subset_train_loader(setup_key=args.setup_key,
+                                           num_dfr_train=args.num_dfr_train,
                                            batch_size=8*args.batch_size,
-                                           num_workers=args.num_workers,
-                                           percent=args.percent_train)
+                                           num_workers=args.num_workers)
                 
     test_loader  = get_test_loader(setup_key=args.setup_key, 
                                    batch_size=8*args.batch_size, 
@@ -277,36 +280,33 @@ def main():
         test_acc = dfr_on_validation_eval(c, all_embeddings, all_y, num_retrains=1, num_classes=num_classes)
         base_model_results["post_dfr"] = test_acc
         dfr_results[0] = base_model_results
-        print_and_save(dfr_results, 'tmp/random-init', args.result_path)
+        print_and_save(dfr_results, 'tmp/random-init', args.result_path, -1)
         return
     
     setup = DATA_SETUPS[args.setup_key]
     num_classes = NUM_CLASSES[setup['dataset_name']]
 
     # Get the list of checkpoints
-    ckpt_list = os.listdir(args.ckpt_directory)
-    ckpt_list = [os.path.join(args.ckpt_directory, ckpt) for ckpt in ckpt_list]
+    ckpt_path = os.path.join(args.ckpt_directory, f'epoch={args.epoch}.pt')
 
     dfr_results = {}
-    for ckpt in ckpt_list:
-        # Tune and evaluate DFR on this checkpoint
-        print("Evaluating DFR on checkpoint", ckpt)
-        model = initialize_checkpoint(args.model_name, 
-                                      setup_key=args.setup_key,
-                                      ckpt_path=ckpt)
+    # Tune and evaluate DFR on this checkpoint
+    print("Evaluating DFR on checkpoint", ckpt_path)
+    model = initialize_checkpoint(args.model_name, 
+                                  setup_key=args.setup_key,
+                                  ckpt_path=ckpt_path)
 
-        # Evaluate model
-        base_model_results = {}
-        epoch = int(ckpt.split("=")[-1].split(".")[0]) # checkpoint name is of the form 'epoch={e}.pt'
-        base_model_results["pre_dfr"] = evaluate_no_min_group(model, test_loader)
+    # Evaluate model
+    base_model_results = {}
+    base_model_results["pre_dfr"] = evaluate_no_min_group(model, test_loader)
 
-        all_embeddings, all_y = get_all_embeddings(args.model_name, model, train_loader, test_loader)
+    all_embeddings, all_y = get_all_embeddings(args.model_name, model, train_loader, test_loader)
 
-        c = 1.0
-        test_acc = dfr_on_validation_eval(c, all_embeddings, all_y, num_retrains=1, num_classes=num_classes)
-        base_model_results["post_dfr"] = test_acc
-        dfr_results[epoch] = base_model_results
-    print_and_save(dfr_results, args.ckpt_directory, args.result_path)
+    c = 1.0
+    test_acc = dfr_on_validation_eval(c, all_embeddings, all_y, num_retrains=1, num_classes=num_classes)
+    base_model_results["post_dfr"] = test_acc
+    dfr_results[args.epoch] = base_model_results
+    print_and_save(dfr_results, args.ckpt_directory, args.result_path, args.epoch)
 
 if __name__ == '__main__':
     main()
